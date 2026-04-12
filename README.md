@@ -409,6 +409,3 @@ All tunable parameters are in `config/settings.py`:
 | `MMR_LAMBDA_MULT` | `0.7` | MMR balance: 0=diverse, 1=relevant |
 | `CHROMA_PERSIST_DIR` | `data/embeddings` | Where ChromaDB stores vectors |
 
----#   a d v a n c e - r e p o r t - g e n e r a t o r  
- #   a d v a n c e d - r e p o r t - g e n e r a t o r  
- 
