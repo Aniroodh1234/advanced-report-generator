@@ -88,10 +88,26 @@ class GeminiLLM:
             safety_settings=self._safety_settings,
         )
 
+        # Streaming config — plain text, NO response_mime_type
+        # (response_mime_type="application/json" is incompatible with stream=True)
+        self._stream_generation_config = genai.types.GenerationConfig(
+            temperature=LLM_TEMPERATURE,
+            max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
+            top_p=LLM_TOP_P,
+            top_k=LLM_TOP_K,
+        )
+
+        # Model for streaming JSON report generation
+        self._stream_model = genai.GenerativeModel(
+            model_name=self.model_name,
+            generation_config=self._stream_generation_config,
+            safety_settings=self._safety_settings,
+        )
+
         log.info(
             f"Gemini LLM ready: model={self.model_name}, "
             f"temp={LLM_TEMPERATURE}, max_tokens={LLM_MAX_OUTPUT_TOKENS}, "
-            f"response_mime_type=application/json"
+            f"response_mime_type=application/json, streaming=enabled"
         )
 
     def generate_json(
@@ -177,6 +193,43 @@ class GeminiLLM:
 
         return {}
 
+    def generate_json_stream(self, prompt: str):
+        """
+        Stream raw token chunks from Gemini as they are generated.
+
+        Uses the stream model (no response_mime_type) so that
+        stream=True actually delivers incremental chunks.
+
+        Yields:
+            str — successive token chunks (partial JSON text)
+
+        After all chunks are yielded, the caller is responsible for
+        assembling and parsing the full JSON via extract_json().
+        """
+        # Prepend instruction to avoid markdown code fences in streaming mode
+        streaming_instruction = (
+            "IMPORTANT: Output ONLY raw JSON. Do NOT wrap the output in "
+            "markdown code fences (```json or ```). Start directly with { "
+            "and end with }. No extra text before or after the JSON.\n\n"
+        )
+        full_prompt = streaming_instruction + prompt
+
+        log.info("Starting streaming JSON generation...")
+        try:
+            stream = self._stream_model.generate_content(full_prompt, stream=True)
+            for chunk in stream:
+                try:
+                    text = chunk.text
+                    if text:
+                        yield text
+                except (ValueError, AttributeError):
+                    # Skip thought/metadata chunks from thinking model
+                    continue
+        except Exception as e:
+            log.error(f"Streaming generation error: {e}")
+            raise
+        log.info("Streaming JSON generation complete.")
+
     def _extract_response_text(self, response) -> str:
         """
         Extract text from a Gemini response, handling thinking models.
@@ -211,7 +264,12 @@ class GeminiLLM:
 
         return ""
 
-    def expand_query(self, category: str, keywords: list) -> str:
+    def expand_query(
+        self,
+        category: str,
+        keywords: list,
+        max_retries: int = 2,
+    ) -> str:
         """
         Expand a category into a rich semantic search query.
 
@@ -221,6 +279,7 @@ class GeminiLLM:
         Args:
             category: User-facing category name
             keywords: Seed keywords for the category
+            max_retries: Number of retry attempts
 
         Returns:
             Expanded query string for vector search
@@ -240,20 +299,30 @@ class GeminiLLM:
             f"Return ONLY the query text, no explanation."
         )
 
-        try:
-            response = self._text_model.generate_content(prompt)
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = self._text_model.generate_content(prompt)
 
-            text = self._extract_response_text(response)
-            if text:
-                expanded = text.strip()
-                log.info(
-                    f"Query expanded for '{category}': "
-                    f"{expanded[:80]}..."
+                text = self._extract_response_text(response)
+                if text:
+                    expanded = text.strip()
+                    log.info(
+                        f"Query expanded for '{category}': "
+                        f"{expanded[:80]}..."
+                    )
+                    return expanded
+                else:
+                    log.warning(
+                        f"Query expansion returned empty response "
+                        f"(attempt {attempt}/{max_retries})"
+                    )
+
+            except Exception as e:
+                log.warning(
+                    f"Query expansion failed (attempt {attempt}/{max_retries}): {e}"
                 )
-                return expanded
-
-        except Exception as e:
-            log.warning(f"Query expansion failed: {e}. Using fallback.")
+                if attempt < max_retries:
+                    time.sleep(1.0)
 
         # Fallback: simple keyword join
         fallback = f"{category} {' '.join(keywords)}"
